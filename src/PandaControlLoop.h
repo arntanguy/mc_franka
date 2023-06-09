@@ -117,6 +117,10 @@ PandaControlLoop<cm, ShowNetworkWarnings>::PandaControlLoop(const std::string & 
     pump->addToLogger(logger_, name);
   }
   device.connect(&robot_);
+  robot_.setCollisionBehavior(std::array<double, 7>{-10},
+                               std::array<double, 7>{10},
+                               std::array<double, 6>{-100},
+                               std::array<double, 6>{100});
   device.addToLogger(logger_, name);
 }
 
