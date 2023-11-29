@@ -1,7 +1,15 @@
 /* Copyright 2020 mc_rtc development team */
 
+#include "MCGlobalControllerBridge.h"
 #include "PandaControlLoop.h"
 
+// #include <mc_control/mc_global_controller.h>
+#include "ControllerBridge.h"
+#include "MCGlobalControllerBridge.h"
+#ifdef WITH_MC_UDP
+  #include "MCUDPControllerBridge.h"
+#endif
+  
 #include <mc_panda/devices/Pump.h>
 #include <mc_panda/devices/Robot.h>
 
@@ -11,6 +19,12 @@ namespace po = boost::program_options;
 namespace mc_franka
 {
 
+// We want to modify this control interface to support both
+// controlling the robot directly with MCGlobalController (existing) and controlling it through UPD
+// The best way I see of achieving this is to provide a common interface to both the controller and the UDP communication
+// and then have a specialization for each case
+
+
 struct ControlLoopDataBase
 {
   ControlLoopDataBase(ControlMode cm, bool show_network_warnings)
@@ -19,7 +33,9 @@ struct ControlLoopDataBase
   }
   ControlMode mode;
   bool show_network_warnings = false;
-  mc_control::MCGlobalController * controller;
+  // XXX should be either controller or UDP Client/Server
+  //mc_control::MCGlobalController * controller;
+  ControllerBridge * controller;
   std::thread * controller_run;
   std::condition_variable controller_run_cv;
   std::vector<std::thread> * panda_threads;
@@ -38,22 +54,18 @@ void * global_thread_init(mc_control::MCGlobalController::GlobalConfiguration & 
   auto frankaConfig = gconfig.config("Franka");
   auto ignoredRobots = frankaConfig("ignored", std::vector<std::string>{});
   auto loop_data = new ControlLoopData<cm, ShowNetworkWarnings>();
-  loop_data->controller = new mc_control::MCGlobalController(gconfig);
+  // TODO choice between UDP and MCGlobalController
+  loop_data->controller = new MCGlobalControllerBridge(gconfig);
   loop_data->panda_threads = new std::vector<std::thread>();
   auto & controller = *loop_data->controller;
-  if(controller.controller().timeStep < 0.001)
+  const double timeStep = controller.timeStep();
+  if(timeStep < 0.001)
   {
     mc_rtc::log::error_and_throw<std::runtime_error>("[mc_franka] mc_rtc cannot run faster than 1kHz with mc_franka");
   }
-  size_t n_steps = std::ceil(controller.controller().timeStep / 0.001);
-  size_t freq = std::ceil(1 / controller.controller().timeStep);
+  size_t n_steps = std::ceil(timeStep / 0.001);
+  size_t freq = std::ceil(1 / timeStep);
   mc_rtc::log::info("[mc_franka] mc_rtc running at {}Hz, will interpolate every {} panda control step", freq, n_steps);
-  auto & robots = controller.controller().robots();
-  // Initialize all real robots
-  for(size_t i = controller.realRobots().size(); i < robots.size(); ++i)
-  {
-    controller.realRobots().robotCopy(robots.robot(i), robots.robot(i).name());
-  }
   // Initialize controlled panda robot
   loop_data->pandas = new std::vector<PandaControlLoopPtr<cm, ShowNetworkWarnings>>();
   auto & pandas = *loop_data->pandas;
@@ -62,6 +74,39 @@ void * global_thread_init(mc_control::MCGlobalController::GlobalConfiguration & 
     std::mutex pandas_init_mutex;
     std::condition_variable pandas_init_cv;
     bool pandas_init_ready = false;
+    // TODO rewrite such that it uses the robots in the config to create the panda control loops
+    // It should only check if it matches with the MCGlobalController robots in MCGLobalControllerBridge
+
+    if(auto frankaConfig = gconfig.config.find("Franka"))
+    {
+      if(auto robots = frankaConfig.find("robots"))
+      {
+        for(auto robot : *robots)
+        {
+          std::string ip = robot("ip");
+          panda_init_threads.emplace_back([&, ip]() {
+            {
+              std::unique_lock<std::mutex> lock(pandas_init_mutex);
+              pandas_init_cv.wait(lock, [&pandas_init_ready]() { return pandas_init_ready; });
+            }
+            // TODO TOMORROW HANDLE DEVICES
+            auto pump = mc_panda::Pump::get(robot);
+            auto & device = *mc_panda::Robot::get(robot);
+            auto panda = std::unique_ptr<PandaControlLoop<cm, ShowNetworkWarnings>>(
+                new PandaControlLoop<cm, ShowNetworkWarnings>(robot.name(), ip, n_steps, device, pump));
+            device.addToLogger(controller.controller().logger(), robot.name());
+            if(pump)
+            {
+              pump->addToLogger(controller.controller().logger(), robot.name());
+            }
+            std::unique_lock<std::mutex> lock(pandas_init_mutex);
+            pandas.emplace_back(std::move(panda));
+          });
+        }
+      }
+    }
+
+    // XXX some of this dead code should be moved to MCUDPControllerBridge
     for(auto & robot : robots)
     {
       if(robot.mb().nrDof() == 0)
@@ -74,24 +119,7 @@ void * global_thread_init(mc_control::MCGlobalController::GlobalConfiguration & 
       }
       if(frankaConfig.has(robot.name()))
       {
-        std::string ip = frankaConfig(robot.name())("ip");
-        panda_init_threads.emplace_back([&, ip]() {
-          {
-            std::unique_lock<std::mutex> lock(pandas_init_mutex);
-            pandas_init_cv.wait(lock, [&pandas_init_ready]() { return pandas_init_ready; });
-          }
-          auto pump = mc_panda::Pump::get(robot);
-          auto & device = *mc_panda::Robot::get(robot);
-          auto panda = std::unique_ptr<PandaControlLoop<cm, ShowNetworkWarnings>>(
-              new PandaControlLoop<cm, ShowNetworkWarnings>(robot.name(), ip, n_steps, device, pump));
-          device.addToLogger(controller.controller().logger(), robot.name());
-          if(pump)
-          {
-            pump->addToLogger(controller.controller().logger(), robot.name());
-          }
-          std::unique_lock<std::mutex> lock(pandas_init_mutex);
-          pandas.emplace_back(std::move(panda));
-        });
+        
       }
       else
       {
@@ -220,6 +248,11 @@ void run_impl(void * data, bool ShowNetworkWarnings)
   }
 }
 
+/**
+ * \brief Run the control loop
+ *
+ * \param data Pointer to the ControlLoopDataBase
+ */
 void run(void * data)
 {
   auto control_data = static_cast<ControlLoopDataBase *>(data);

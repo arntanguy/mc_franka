@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.1)
 
 project(mc_franka LANGUAGES CXX VERSION 1.0.0)
+option(WITH_MC_UDP "Build with UDP server support" OFF)
 
 set(CMAKE_INSTALL_RPATH "$ENV{LD_LIBRARY_PATH}")
 
@@ -29,10 +30,22 @@ set(MCFrankaControl_SRC
   src/PandaControlLoop.h
   src/PandaControlType.h
   src/thread.h
+  src/ControllerBridge.h
+  src/MCGlobalControllerBridge.h
 )
+
+if(WITH_MC_UDP)
+  message(STATUS "Building with UDP server support")
+  find_package(mc_udp REQUIRED) # optional, build with UDP server support
+  list(APPEND MCFrankaControl_SRC src/MCUDPControllerBridge.h)
+endif()
 
 add_executable(MCFrankaControl ${MCFrankaControl_SRC})
 target_link_libraries(MCFrankaControl PUBLIC mc_rtc::mc_control Franka::Franka Boost::program_options mc_panda::devices)
+if(WITH_MC_UDP)
+  target_link_libraries(MCFrankaControl PUBLIC mc_udp::mc_udp_server)
+  target_compile_definitions(MCFrankaControl PUBLIC WITH_MC_UDP)
+endif()
 # CAP_SYS_NICE is required to set the SCHED_DEADLINE policy, we set it on the generated executable and the installed one
 set(JOB_POOL_OPTION)
 if(${CMAKE_VERSION} VERSION_GREATER "3.14")
