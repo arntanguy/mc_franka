@@ -175,7 +175,7 @@ template<ControlMode cm, bool ShowNetworkWarnings>
 void PandaControlLoop<cm, ShowNetworkWarnings>::updateControl(mc_control::MCGlobalController & controller)
 {
   std::unique_lock<std::mutex> lock(updateControlMutex_);
-  auto & robot = controller.controller().robots().robot(name_);
+  auto & robot = controller.controller().outputRobots().robot(name_);
   command_ = robot.mbc();
   control_id_++;
 }
