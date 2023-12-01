@@ -125,7 +125,7 @@ void * global_thread_init(mc_control::MCGlobalController::GlobalConfiguration & 
   }
   startControl = true;
   startCV.notify_all();
-  loop_data->controller_run = new std::thread([loop_data]() {
+  loop_data->controller_run = new std::thread([loop_data, n_steps]() {
     auto controller_ptr = loop_data->controller;
     auto & controller = *controller_ptr;
     auto & pandas = *loop_data->pandas;
@@ -137,6 +137,7 @@ void * global_thread_init(mc_control::MCGlobalController::GlobalConfiguration & 
     // Will record the time that passed between two runs
     double elapsed_t = 0;
     controller.controller().logger().addLogEntry("mc_franka_delay", [&elapsed_t]() { return elapsed_t; });
+    size_t step = 0;
     while(controller.running)
     {
       std::unique_lock lck(controller_run_mtx);
@@ -149,13 +150,17 @@ void * global_thread_init(mc_control::MCGlobalController::GlobalConfiguration & 
       {
         panda->updateSensors(controller);
       }
-      // Run the controller
-      controller.run();
+      if(step == 0 || step % n_steps == 0)
+      {
+        // Run the controller
+        controller.run();
+      }
       // Update panda commands
       for(auto & panda : pandas)
       {
         panda->updateControl(controller);
       }
+      ++step;
     }
   });
 #ifndef WIN32
