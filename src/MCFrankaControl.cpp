@@ -121,7 +121,36 @@ void * global_thread_init(mc_control::MCGlobalController::GlobalConfiguration & 
     loop_data->panda_states.emplace_back(panda->getSensors());
     loop_data->panda_commands.emplace_back(panda->getCommand());
   }
-  controller.init(robots.robot().encoderValues());
+  if(robots.robot().encoderValues().empty())
+  { // Initialize the main robot to halfsitting if the encoders have not been set
+    mc_rtc::log::warning(
+        "[MCFrankaControl] Main robot {} does not have encoder values, initializing from the default stance",
+        robots.robot().name());
+    /** Get the encoders of a robot from the robot's configuration */
+    auto get_encoders = [](const mc_rbdyn::Robot & robot) {
+      std::vector<double> q;
+      q.reserve(robot.refJointOrder().size());
+      for(size_t i = 0; i < robot.refJointOrder().size(); ++i)
+      {
+        auto mbcIdx = robot.jointIndexInMBC(i);
+        if(mbcIdx == -1)
+        {
+          q.push_back(0.0);
+          continue;
+        }
+        for(const auto & qi : robot.mbc().q[static_cast<size_t>(mbcIdx)])
+        {
+          q.push_back(qi);
+        }
+      }
+      return q;
+    };
+    controller.init(get_encoders(robots.robot()));
+  }
+  else
+  {
+    controller.init(robots.robot().encoderValues());
+  }
   controller.running = true;
   controller.controller().gui()->addElement(
       {"Franka"}, mc_rtc::gui::Button("Stop controller", [&controller]() { controller.running = false; }));
