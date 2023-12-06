@@ -6,6 +6,7 @@
 
 #include <franka/exception.h>
 #include <franka/robot.h>
+#include <mc_rtc/io_utils.h>
 
 #include "ControlMode.h"
 
@@ -32,12 +33,15 @@ struct PandaControlType<ControlMode::Position> : public franka::JointPositions
   PandaControlType(const franka::RobotState & state) : franka::JointPositions(state.q), prev_q_(state.q) {}
 
   // Interpolate control value from the data in a robot
-  franka::JointPositions update(const mc_rbdyn::Robot & robot, const rbd::MultiBodyConfig & mbc, size_t iter, size_t N)
+  franka::JointPositions update(const mc_rbdyn::Robot & robot,
+                                const franka::RobotCommand & command,
+                                size_t iter,
+                                size_t N)
   {
     const auto & rjo = robot.refJointOrder();
     for(size_t i = 0; i < q.size(); ++i)
     {
-      q[i] = prev_q_[i] + (iter + 1) * (mbc.q[robot.jointIndexByName(rjo[i])][0] - prev_q_[i]) / N;
+      q[i] = prev_q_[i] + (iter + 1) * (command.joint_positions.q[i] - prev_q_[i]) / N;
     }
     if(iter + 1 == N)
     {
@@ -64,13 +68,21 @@ struct PandaControlType<ControlMode::Velocity> : public franka::JointVelocities
   PandaControlType(const franka::RobotState & state) : franka::JointVelocities(state.dq) {}
 
   // Update control value from the data in a robot
-  franka::JointVelocities update(const mc_rbdyn::Robot & robot, const rbd::MultiBodyConfig & mbc, size_t, size_t)
+  franka::JointVelocities update(const mc_rbdyn::Robot & robot, const franka::RobotCommand & command, size_t, size_t)
   {
     const auto & rjo = robot.refJointOrder();
     for(size_t i = 0; i < dq.size(); ++i)
     {
-      dq[i] = mbc.alpha[robot.jointIndexByName(rjo[i])][0];
+      dq[i] = command.joint_velocities.dq[i];
     }
+    mc_rtc::log::info("Velocity would have been: {}", mc_rtc::io::to_string(dq));
+
+    // XXX do not move for now
+    for(size_t i = 0; i < dq.size(); ++i)
+    {
+      dq[i] = 0;
+    }
+
     return *this;
   }
 
@@ -89,12 +101,12 @@ struct PandaControlType<ControlMode::Torque> : public franka::Torques
   PandaControlType(const franka::RobotState & state) : franka::Torques(state.tau_J) {}
 
   // Update control value from the data in a robot
-  franka::Torques update(const mc_rbdyn::Robot & robot, const rbd::MultiBodyConfig & mbc, size_t, size_t)
+  franka::Torques update(const mc_rbdyn::Robot & robot, const franka::RobotCommand & command, size_t, size_t)
   {
     const auto & rjo = robot.refJointOrder();
     for(size_t i = 0; i < tau_J.size(); ++i)
     {
-      tau_J[i] = mbc.jointTorque[robot.jointIndexByName(rjo[i])][0];
+      tau_J[i] = command.torques.tau_J[i];
     }
     return *this;
   }

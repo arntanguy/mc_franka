@@ -5,6 +5,8 @@
 #include "PandaControlType.h"
 #include "defs.h"
 
+#include <franka/log.h>
+#include <franka/robot.h>
 #include <mc_panda/devices/Pump.h>
 #include <mc_panda/devices/Robot.h>
 
@@ -16,6 +18,10 @@
 
 namespace mc_franka
 {
+
+// control thread
+// sensors: mc_franka::RobotState
+// control: mc_franka::RobotCommand
 
 /** The PandaControlLoop implements two things:
  *
@@ -50,10 +56,32 @@ struct PandaControlLoop
   void init(mc_control::MCGlobalController & controller);
 
   /** Update sensors in mc_rtc instance */
-  void updateSensors(mc_control::MCGlobalController & controller);
+  void updateSensors(const franka::RobotState & state, mc_control::MCGlobalController & controller);
 
-  /** Update command from mc_rtc output */
-  void updateControl(mc_control::MCGlobalController & controller);
+  /** Get the latest sensor values
+   */
+  franka::RobotState getSensors()
+  {
+    std::unique_lock<std::mutex> senLock(updateSensorsMutex_);
+    return state_;
+  }
+
+  /** Update command from mc_rtc output
+   * This is expected to be called from mc_rtc's control thread
+   */
+  void updateCommand(mc_control::MCGlobalController & controller, franka::RobotCommand & command);
+
+  franka::RobotCommand getCommand()
+  {
+    std::unique_lock<std::mutex> ctlLock(updateControlMutex_);
+    return command_;
+  }
+
+  /**
+   * Update command from mc_rtc output
+   * This is expected to be called from the RT thread at robot's control frequency
+   */
+  void updateControl(const franka::RobotCommand & command);
 
   /** Start the libfranka control loop
    *
@@ -76,15 +104,16 @@ struct PandaControlLoop
                      bool & running);
 
 private:
-  std::string name_;
-  franka::Robot robot_;
-  franka::RobotState state_;
+  std::string name_; // Name of the mc_rtc robot being controlled
+  franka::Robot robot_; // Real robot control interface
+  franka::RobotState state_; // Last state from robot
   PandaControlType<cm> control_;
   mc_panda::Robot & device_;
   size_t steps_ = 1;
   mc_rtc::Logger logger_;
   size_t sensor_id_ = 0;
-  rbd::MultiBodyConfig command_;
+  // rbd::MultiBodyConfig command_;
+  franka::RobotCommand command_; // Desired command computed by mc_rtc
   size_t control_id_ = 0;
   size_t prev_control_id_ = 0;
   double delay_ = 0;
@@ -129,8 +158,10 @@ void PandaControlLoop<cm, ShowNetworkWarnings>::init(mc_control::MCGlobalControl
   logger_.addLogEntry("prev_control_id", [this]() { return prev_control_id_; });
   logger_.addLogEntry("control_id", [this]() { return control_id_; });
   logger_.addLogEntry("delay", [this]() { return delay_; });
-  updateSensors(controller);
-  updateControl(controller);
+  updateSensors(state_, controller); // Read initial sensor values
+  auto command = franka::RobotCommand{};
+  updateCommand(controller, command); // Use sensor values as initial command
+  updateControl(command);
   prev_control_id_ = control_id_;
   auto & robot = controller.controller().robots().robot(name_);
   auto & real = controller.controller().realRobots().robot(name_);
@@ -146,9 +177,9 @@ void PandaControlLoop<cm, ShowNetworkWarnings>::init(mc_control::MCGlobalControl
 }
 
 template<ControlMode cm, bool ShowNetworkWarnings>
-void PandaControlLoop<cm, ShowNetworkWarnings>::updateSensors(mc_control::MCGlobalController & controller)
+void PandaControlLoop<cm, ShowNetworkWarnings>::updateSensors(const franka::RobotState & state,
+                                                              mc_control::MCGlobalController & controller)
 {
-  std::unique_lock<std::mutex> lock(updateSensorsMutex_);
   auto & robot = controller.controller().robots().robot(name_);
   using GC = mc_control::MCGlobalController;
   using set_sensor_t = void (GC::*)(const std::string &, const std::vector<double> &);
@@ -157,26 +188,39 @@ void PandaControlLoop<cm, ShowNetworkWarnings>::updateSensors(mc_control::MCGlob
     std::memcpy(sensorsBuffer_.data(), data.data(), 7 * sizeof(double));
     (controller.*set_sensor)(robot.name(), sensorsBuffer_);
   };
-  updateSensor(&GC::setEncoderValues, state_.q);
-  updateSensor(&GC::setEncoderVelocities, state_.dq);
-  updateSensor(&GC::setJointTorques, state_.tau_J);
+  updateSensor(&GC::setEncoderValues, state.q);
+  updateSensor(&GC::setEncoderVelocities, state.dq);
+  updateSensor(&GC::setJointTorques, state.tau_J);
   auto wrench = sva::ForceVecd::Zero();
-  wrench.force().x() = state_.K_F_ext_hat_K[0];
-  wrench.force().y() = state_.K_F_ext_hat_K[1];
-  wrench.force().z() = state_.K_F_ext_hat_K[2];
-  wrench.couple().x() = state_.K_F_ext_hat_K[3];
-  wrench.couple().y() = state_.K_F_ext_hat_K[4];
-  wrench.couple().z() = state_.K_F_ext_hat_K[5];
+  wrench.force().x() = state.K_F_ext_hat_K[0];
+  wrench.force().y() = state.K_F_ext_hat_K[1];
+  wrench.force().z() = state.K_F_ext_hat_K[2];
+  wrench.couple().x() = state.K_F_ext_hat_K[3];
+  wrench.couple().y() = state.K_F_ext_hat_K[4];
+  wrench.couple().z() = state.K_F_ext_hat_K[5];
   robot.data()->forceSensors[robot.data()->forceSensorsIndex.at("LeftHandForceSensor")].wrench(wrench);
-  device_.state(state_);
+  device_.state(state);
 }
 
 template<ControlMode cm, bool ShowNetworkWarnings>
-void PandaControlLoop<cm, ShowNetworkWarnings>::updateControl(mc_control::MCGlobalController & controller)
+void PandaControlLoop<cm, ShowNetworkWarnings>::updateCommand(mc_control::MCGlobalController & controller,
+                                                              franka::RobotCommand & command)
+{
+  const auto & robot = controller.controller().robots().robot(name_);
+  for(size_t i = 0; i < robot.refJointOrder().size(); ++i)
+  {
+    auto jIndex = robot.jointIndexByName(robot.refJointOrder()[i]);
+    command.joint_positions.q[i] = robot.mbc().q[jIndex][0];
+    command.joint_velocities.dq[i] = robot.mbc().alpha[jIndex][0];
+    command.torques.tau_J[i] = robot.mbc().jointTorque[jIndex][0];
+  }
+}
+
+template<ControlMode cm, bool ShowNetworkWarnings>
+void PandaControlLoop<cm, ShowNetworkWarnings>::updateControl(const franka::RobotCommand & command)
 {
   std::unique_lock<std::mutex> lock(updateControlMutex_);
-  auto & robot = controller.controller().robots().robot(name_);
-  command_ = robot.mbc();
+  command_ = command;
   control_id_++;
 }
 

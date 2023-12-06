@@ -2,10 +2,13 @@
 
 #include "PandaControlLoop.h"
 
+#include <algorithm>
 #include <mc_panda/devices/Pump.h>
 #include <mc_panda/devices/Robot.h>
 
 #include <boost/program_options.hpp>
+#include <mc_rbdyn/ForceSensorCalibData.h>
+#include <mutex>
 namespace po = boost::program_options;
 
 namespace mc_franka
@@ -23,6 +26,11 @@ struct ControlLoopDataBase
   std::thread * controller_run;
   std::condition_variable controller_run_cv;
   std::vector<std::thread> * panda_threads;
+
+  std::vector<franka::RobotState> panda_states;
+  std::mutex sensor_update_mutex;
+  std::vector<franka::RobotCommand> panda_commands;
+  std::mutex control_update_mutex;
 };
 
 template<ControlMode cm, bool ShowNetworkWarnings>
@@ -106,9 +114,12 @@ void * global_thread_init(mc_control::MCGlobalController::GlobalConfiguration & 
       th.join();
     }
   }
-  for(auto & panda : pandas)
+  for(size_t i = 0; i < pandas.size(); ++i)
   {
+    auto & panda = pandas[i];
     panda->init(controller);
+    loop_data->panda_states.emplace_back(panda->getSensors());
+    loop_data->panda_commands.emplace_back(panda->getCommand());
   }
   controller.init(robots.robot().encoderValues());
   controller.running = true;
@@ -126,41 +137,39 @@ void * global_thread_init(mc_control::MCGlobalController::GlobalConfiguration & 
   startControl = true;
   startCV.notify_all();
   loop_data->controller_run = new std::thread([loop_data, n_steps]() {
-    auto controller_ptr = loop_data->controller;
-    auto & controller = *controller_ptr;
-    auto & pandas = *loop_data->pandas;
+    auto & controller = *loop_data->controller;
     std::mutex controller_run_mtx;
-    timespec tv;
-    clock_gettime(CLOCK_REALTIME, &tv);
-    // Current time in milliseconds
-    double current_t = tv.tv_sec * 1000 + tv.tv_nsec * 1e-6;
-    // Will record the time that passed between two runs
-    double elapsed_t = 0;
-    controller.controller().logger().addLogEntry("mc_franka_delay", [&elapsed_t]() { return elapsed_t; });
-    size_t step = 0;
+    // controller.controller().logger().addLogEntry("mc_franka_delay", [&elapsed_t]() { return elapsed_t; });
     while(controller.running)
     {
       std::unique_lock lck(controller_run_mtx);
       loop_data->controller_run_cv.wait(lck);
-      clock_gettime(CLOCK_REALTIME, &tv);
-      elapsed_t = tv.tv_sec * 1000 + tv.tv_nsec * 1e-6 - current_t;
-      current_t = elapsed_t + current_t;
-      // Update from panda sensors
-      for(auto & panda : pandas)
+
+      // Copy sensors
       {
-        panda->updateSensors(controller);
+        std::unique_lock sensor_lock(loop_data->sensor_update_mutex);
+        for(size_t i = 0; i < loop_data->pandas->size(); ++i)
+        {
+          auto & panda = (*loop_data->pandas)[i];
+          auto state = loop_data->panda_states[i];
+          // Update sensors in mc_rtc for this robot
+          panda->updateSensors(state, controller);
+        }
       }
-      if(step == 0 || step % n_steps == 0)
-      {
-        // Run the controller
-        controller.run();
+
+      mc_rtc::log::info("Running controller");
+      controller.run();
+
+      { // Copy commands
+        std::unique_lock control_lock(loop_data->control_update_mutex);
+        for(size_t i = 0; i < loop_data->pandas->size(); ++i)
+        {
+          auto & panda = (*loop_data->pandas)[i];
+          auto & command = loop_data->panda_commands[i];
+          // Update command from mc_rtc
+          panda->updateCommand(controller, command);
+        }
       }
-      // Update panda commands
-      for(auto & panda : pandas)
-      {
-        panda->updateControl(controller);
-      }
-      ++step;
     }
   });
 #ifndef WIN32
@@ -197,9 +206,56 @@ void run_impl(void * data)
   auto control_data = static_cast<ControlLoopData<cm, ShowNetworkWarnings> *>(data);
   auto controller_ptr = control_data->controller;
   auto & controller = *controller_ptr;
+  auto & pandas = *control_data->pandas;
+
+  timespec tv;
+  clock_gettime(CLOCK_REALTIME, &tv);
+  // Current time in milliseconds
+  double current_t = tv.tv_sec * 1000 + tv.tv_nsec * 1e-6;
+  // Will record the time that passed between two runs
+  double elapsed_t = 0;
+  size_t step = 0;
+  size_t n_steps = std::ceil(controller.controller().timeStep / 0.001);
+
   while(controller.running)
-  {
-    control_data->controller_run_cv.notify_one();
+  { // Main RT control loop running every 1ms
+    // This should handle getting data from/to the robot
+    clock_gettime(CLOCK_REALTIME, &tv);
+    elapsed_t = tv.tv_sec * 1000 + tv.tv_nsec * 1e-6 - current_t;
+    current_t = elapsed_t + current_t;
+
+    // Update from all panda robots' sensors
+    {
+      std::lock_guard<std::mutex> sensors_lock(control_data->control_update_mutex);
+      for(size_t i = 0; i < pandas.size(); ++i)
+      {
+        auto & panda = pandas[i];
+        auto & state = control_data->panda_states[i];
+        state = panda->getSensors();
+      }
+    }
+
+    if(step == 0 || step % n_steps == 0)
+    {
+      mc_rtc::log::info("Asking controller to run (step = {})", step);
+      // Trigger controller run (non blocking)
+      // Assume this runs under 5ms
+      control_data->controller_run_cv.notify_one();
+      // this used to be blocking
+    }
+
+    {
+      std::lock_guard<std::mutex> control_lock(control_data->control_update_mutex);
+      // Update all panda robots' commands
+      for(size_t i = 0; i < pandas.size(); ++i)
+      {
+        auto & panda = pandas[i];
+        const auto & command = control_data->panda_commands[i];
+        panda->updateControl(command);
+      }
+    }
+    ++step;
+
     // Sleep until the next cycle
     sched_yield();
   }
