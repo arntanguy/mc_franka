@@ -65,23 +65,44 @@ struct PandaControlType<ControlMode::Velocity> : public franka::JointVelocities
   using ReturnT = franka::JointVelocities;
   using CallbackT = std::function<ReturnT(const franka::RobotState &, franka::Duration)>;
 
-  PandaControlType(const franka::RobotState & state) : franka::JointVelocities(state.dq) {}
+  PandaControlType(const franka::RobotState & state) : franka::JointVelocities(state.dq), prev_dq_(state.dq) {}
+
+  // // Update control value from the data in a robot
+  // franka::JointVelocities update(const mc_rbdyn::Robot & robot, const franka::RobotCommand & command, size_t, size_t)
+  // {
+  //   const auto & rjo = robot.refJointOrder();
+  //   for(size_t i = 0; i < dq.size(); ++i)
+  //   {
+  //     dq[i] = command.joint_velocities.dq[i];
+  //   }
+  //   mc_rtc::log::info("Velocity would have been: {}", mc_rtc::io::to_string(dq));
+
+  //   // XXX do not move for now
+  //   /* for(size_t i = 0; i < dq.size(); ++i) */
+  //   /* { */
+  //   /*   dq[i] = 0; */
+  //   /* } */
+
+  //   return *this;
+  // }
 
   // Update control value from the data in a robot
-  franka::JointVelocities update(const mc_rbdyn::Robot & robot, const franka::RobotCommand & command, size_t, size_t)
+  franka::JointVelocities update(const mc_rbdyn::Robot & robot,
+                                 const franka::RobotCommand & command,
+                                 size_t iter,
+                                 size_t N)
   {
     const auto & rjo = robot.refJointOrder();
     for(size_t i = 0; i < dq.size(); ++i)
     {
-      dq[i] = command.joint_velocities.dq[i];
+      // interpolate velocity
+      dq[i] = prev_dq_[i] + (iter + 1) * (command.joint_velocities.dq[i] - prev_dq_[i]) / N;
     }
-    mc_rtc::log::info("Velocity would have been: {}", mc_rtc::io::to_string(dq));
 
-    // XXX do not move for now
-    /* for(size_t i = 0; i < dq.size(); ++i) */
-    /* { */
-    /*   dq[i] = 0; */
-    /* } */
+    if(iter + 1 == N)
+    {
+      prev_dq_ = dq;
+    }
 
     return *this;
   }
@@ -90,6 +111,9 @@ struct PandaControlType<ControlMode::Velocity> : public franka::JointVelocities
   {
     robot.control(cb, franka::ControllerMode::kJointImpedance, true, 1000);
   }
+
+protected:
+  std::array<double, 7> prev_dq_;
 };
 
 template<>

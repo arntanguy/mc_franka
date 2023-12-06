@@ -186,7 +186,7 @@ void * global_thread_init(mc_control::MCGlobalController::GlobalConfiguration & 
         }
       }
 
-      mc_rtc::log::info("Running controller");
+      /* mc_rtc::log::info("Running controller"); */
       controller.run();
 
       { // Copy commands
@@ -274,7 +274,7 @@ void run_impl(void * data)
         commands = control_data->panda_commands;
       }
 
-      mc_rtc::log::info("Asking controller to run (step = {})", step);
+      /* mc_rtc::log::info("Asking controller to run (step = {})", step); */
       // Trigger controller run (non blocking)
       // Assume this runs under 5ms
       control_data->controller_run_cv.notify_one();
