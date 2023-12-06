@@ -78,10 +78,10 @@ struct PandaControlType<ControlMode::Velocity> : public franka::JointVelocities
     mc_rtc::log::info("Velocity would have been: {}", mc_rtc::io::to_string(dq));
 
     // XXX do not move for now
-    for(size_t i = 0; i < dq.size(); ++i)
-    {
-      dq[i] = 0;
-    }
+    /* for(size_t i = 0; i < dq.size(); ++i) */
+    /* { */
+    /*   dq[i] = 0; */
+    /* } */
 
     return *this;
   }

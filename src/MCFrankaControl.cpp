@@ -212,7 +212,7 @@ void * global_thread_init(mc_control::MCGlobalController::GlobalConfiguration & 
   if(pthread_setschedparam(th_handle, SCHED_RR, &param) != 0)
   {
     mc_rtc::log::warning(
-        "[MCFrankaControl] Failed to lower calibration thread priority. If you are running on a real-time system, "
+        "[MCFrankaControl] Failed to lower control thread priority. If you are running on a real-time system, "
         "this might cause latency to the real-time loop.");
   }
 #endif
@@ -246,6 +246,8 @@ void run_impl(void * data)
   size_t step = 0;
   size_t n_steps = std::ceil(controller.controller().timeStep / 0.001);
 
+  std::vector<franka::RobotCommand> commands = control_data->panda_commands;
+
   while(controller.running)
   { // Main RT control loop running every 1ms
     // This should handle getting data from/to the robot
@@ -266,6 +268,12 @@ void run_impl(void * data)
 
     if(step == 0 || step % n_steps == 0)
     {
+      // Applying command from previous iteration (or initial command)
+      {
+        std::lock_guard<std::mutex> control_lock(control_data->control_update_mutex);
+        commands = control_data->panda_commands;
+      }
+
       mc_rtc::log::info("Asking controller to run (step = {})", step);
       // Trigger controller run (non blocking)
       // Assume this runs under 5ms
@@ -274,7 +282,6 @@ void run_impl(void * data)
     }
 
     {
-      std::lock_guard<std::mutex> control_lock(control_data->control_update_mutex);
       // Update all panda robots' commands
       for(size_t i = 0; i < pandas.size(); ++i)
       {
