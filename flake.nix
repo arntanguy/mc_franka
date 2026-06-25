@@ -56,6 +56,7 @@
                     hash = "sha256-koREkrfAHWfpqITN5afiXwZg37Wve2Ftx8sr8t2bSV4=";
                     rev = "poco-1.14.2-release";
                   };
+                  doCheck = !pkgs-final.stdenv.hostPlatform.isDarwin;
                 };
             };
 
